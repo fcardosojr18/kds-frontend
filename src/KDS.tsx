@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 // ---- CONFIG ----
-const USE_MOCK = false; // <- change to false when your Go backend is ready
+const USE_MOCK = false;
 
 const ENDPOINTS = {
   list: "/api/kds/orders",
   update: (id: string) => `/api/kds/orders/${id}`,
+  bump: (id: string) => `/api/kds/orders/${id}/bump`,
 };
 const WS_URL = (location.origin || "").replace("http", "ws") + "/api/kds/ws";
 const STATIONS = ["All", "Grill", "Fry", "Cold", "Dessert", "Bar", "Expo"] as const;
@@ -62,46 +63,6 @@ async function jfetch(input: RequestInfo, init?: RequestInit, timeoutMs = 6000) 
   }
 }
 
-// ---- MOCK ORDERS ----
-function makeMockOrders(): KdsOrder[] {
-  const base = new Date();
-  const ago = (mins: number) => new Date(base.getTime() - mins * 60000).toISOString();
-  return [
-    {
-      id: "101",
-      orderNumber: "101",
-      table: "A2",
-      type: "DINE_IN",
-      station: "Grill",
-      status: "NEW",
-      createdAt: ago(2),
-      items: [
-        { name: "Cheeseburger", qty: 2, mods: ["no pickles", "add bacon"], station: "Grill" },
-        { name: "Fries", qty: 1, station: "Fry" },
-      ],
-      notes: "Allergy: peanut",
-    },
-    {
-      id: "102",
-      orderNumber: "102",
-      type: "TAKEOUT",
-      station: "Fry",
-      status: "COOKING",
-      createdAt: ago(8),
-      items: [{ name: "Chicken Tenders", qty: 1, mods: ["extra crispy"], station: "Fry" }],
-    },
-    {
-      id: "103",
-      orderNumber: "103",
-      type: "DELIVERY",
-      station: "Cold",
-      status: "READY",
-      createdAt: ago(13),
-      items: [{ name: "Caesar Salad", qty: 1, mods: ["no croutons"], station: "Cold" }],
-    },
-  ];
-}
-
 // ---- MAIN COMPONENT ----
 export default function KDS() {
   const [orders, setOrders] = useState<KdsOrder[]>([]);
@@ -112,34 +73,35 @@ export default function KDS() {
   const [lastSeenIds, setLastSeenIds] = useState<Set<string>>(new Set());
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Load orders (mock or API)
+  // Load orders (polling)
   useEffect(() => {
-  let cancelled = false;
+    let cancelled = false;
 
-  const load = async () => {
-    setLoading(true);
-    try {
-      const res = (await jfetch(ENDPOINTS.list)) as KdsOrder[];
-      if (!cancelled) {
-        setOrders(res);
-        setLoading(false);
+    const load = async () => {
+      setLoading(true);
+      try {
+        const res = (await jfetch(ENDPOINTS.list)) as KdsOrder[];
+        if (!cancelled) {
+          // overwrite, don't append
+          setOrders(res);
+          setLoading(false);
+        }
+      } catch (e) {
+        console.warn("KDS: failed to load from API", e);
+        if (!cancelled) {
+          setOrders([]);
+          setLoading(false);
+        }
       }
-    } catch (e) {
-      console.warn("KDS: failed to load from API", e);
-      if (!cancelled) {
-        setOrders([]);           // <--- show empty instead of mock
-        setLoading(false);
-      }
-    }
-  };
+    };
 
-  load();
-  const iv = setInterval(load, 10_000);
-  return () => {
-    cancelled = true;
-    clearInterval(iv);
-  };
-}, []);
+    load();
+    const iv = setInterval(load, 10_000);
+    return () => {
+      cancelled = true;
+      clearInterval(iv);
+    };
+  }, []);
 
   // Sound alert for new tickets
   useEffect(() => {
@@ -180,9 +142,11 @@ export default function KDS() {
   }, [filtered]);
 
   async function setStatus(id: string, status: Status) {
+    // local
     setOrders((prev) =>
       prev.map((o) => (o.id === id ? { ...o, status, bumpedAt: new Date().toISOString() } : o))
     );
+    // backend
     if (!USE_MOCK) {
       try {
         await jfetch(ENDPOINTS.update(id), {
@@ -191,8 +155,19 @@ export default function KDS() {
           body: JSON.stringify({ status }),
         });
       } catch {
-        console.warn("Failed to update backend; will stay local");
+        console.warn("Failed to update backend; staying local only");
       }
+    }
+  }
+
+  async function bumpAndRemove(id: string) {
+    // remove from UI immediately
+    setOrders((prev) => prev.filter((o) => o.id !== id));
+    // tell backend it is done/bumped
+    try {
+      await fetch(ENDPOINTS.bump(id), { method: "POST" });
+    } catch (e) {
+      console.warn("failed to bump on backend", e);
     }
   }
 
@@ -232,7 +207,7 @@ export default function KDS() {
           </button>
           <button
             onClick={() => setSoundOn((s) => !s)}
-           className={`px-3 py-2 rounded-lg ${
+            className={`px-3 py-2 rounded-lg ${
               soundOn ? "bg-emerald-600" : "bg-zinc-900 border border-zinc-800"
             }`}
           >
@@ -258,7 +233,7 @@ export default function KDS() {
           title="Ready"
           orders={lanes.READY}
           onRecall={(id) => setStatus(id, "COOKING")}
-          onDone={(id) => setOrders((prev) => prev.filter((o) => o.id !== id))}
+          onDone={(id) => bumpAndRemove(id)}
         />
       </main>
 
@@ -341,10 +316,7 @@ function TicketCard({
 
       <ul className="space-y-2">
         {order.items.map((it, idx) => (
-          <li
-            key={idx}
-            className="bg-zinc-950/50 rounded-xl border border-zinc-800 p-2"
-          >
+          <li key={idx} className="bg-zinc-950/50 rounded-xl border border-zinc-800 p-2">
             <div className="flex items-start justify-between gap-2">
               <div>
                 <div className="font-semibold">
@@ -355,9 +327,7 @@ function TicketCard({
                 )}
               </div>
               {it.station && (
-                <span className="text-xs px-2 py-1 rounded bg-zinc-900">
-                  {it.station}
-                </span>
+                <span className="text-xs px-2 py-1 rounded bg-zinc-900">{it.station}</span>
               )}
             </div>
           </li>
@@ -397,4 +367,3 @@ function TicketCard({
     </div>
   );
 }
-
